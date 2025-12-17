@@ -37,7 +37,12 @@ for sheet_name in xls.sheet_names:
         data.columns = header
         df = data
         df.columns = [str(c).strip() for c in df.columns]
-
+        # Filter to keep only COMP courses
+        if "Course" in df.columns:
+            df = df[df["Course"].astype(str).str.contains("COMP", na=False)]
+            if df.empty:
+                print(f"Skipping sheet '{sheet_name}' (no COMP courses found)")
+                continue
     # Decide which capacity column to use
     cap_col = None
     if "Cap." in df.columns:
