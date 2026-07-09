@@ -35,12 +35,13 @@ app.add_middleware(
 
 # ── File slug → filename map ──────────────────────────────────────────────────
 FILE_MAP: Dict[str, str] = {
-    "courses":          "course-list-Spring 27(Sheet1) (1).csv",
-    "preferences":      "prof_preferences.csv",
-    "faculty_load":     "faculty_load.csv",
-    "timings":          "timings.csv",
-    "rooms":            "rooms.csv",
-    "room_preferences": "room_preferences.csv",
+    "courses":            "course-list-Spring 27(Sheet1) (1).csv",
+    "preferences":        "prof_preferences.csv",
+    "faculty_load":       "faculty_load.csv",
+    "timings":            "timings.csv",
+    "rooms":              "rooms.csv",
+    "room_preferences":   "room_preferences.csv",
+    "non_overlap_groups": "non_overlap_groups.csv",
 }
 
 # ── Scheduler state ───────────────────────────────────────────────────────────

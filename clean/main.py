@@ -201,6 +201,14 @@ def times_conflict(s1: int, e1: int, s2: int, e2: int, gap: int = FACULTY_GAP_MI
     return not (e1 + gap <= s2 or e2 + gap <= s1)
 
 
+def blocks_overlap(days1: List[str], s1: int, e1: int, days2: List[str], s2: int, e2: int) -> bool:
+    """True if two (days, start_min, end_min) blocks share a day and their times
+    actually overlap (no faculty gap applied — this is a student-scheduling check)."""
+    if not (set(days1) & set(days2)):
+        return False
+    return s1 < e2 and s2 < e1
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CSV LOADERS
@@ -311,6 +319,29 @@ def load_room_preferences(path: str) -> Dict[Tuple[str, str], List[RoomPreferenc
             out.setdefault(key, []).append(pref)
     for lst in out.values():
         lst.sort(key=lambda p: p.rank)
+    return out
+
+
+def load_non_overlap_groups(path: str) -> Dict[str, List[str]]:
+    """Returns {group_name: [normalized_course_number, ...]}.
+
+    Each group is a set of courses students are expected to take in the same
+    semester per the curriculum (e.g. COMP2000/COMP2100/COMP2650 in Fall
+    Year 2). The scheduler tries to keep at least one non-overlapping section
+    per course within a group; groups/courses can be added by editing this CSV.
+    """
+    out: Dict[str, List[str]] = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            group = (r.get("group") or "").strip()
+            course = normalize(r.get("course_number") or "")
+            if not group or not course:
+                continue
+            lst = out.setdefault(group, [])
+            if course not in lst:
+                lst.append(course)
     return out
 
 
@@ -567,6 +598,7 @@ def build_schedule(
     faculty_limits: Dict[str, int],
     time_sched: TimeSlotScheduler,
     room_assigner: RoomAssigner,
+    non_overlap_groups: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, ScheduledSection]:
     """
     Jointly assigns faculty + day pattern + time slot + room for each section so that
@@ -575,6 +607,45 @@ def build_schedule(
     """
     lectures: Dict[str, ScheduledSection] = {}
     labs: List[ScheduledSection] = []
+
+    # ── non-overlap groups (data/non_overlap_groups.csv) ───────────────────────
+    # course_to_groups: normalized course number → list of group names it belongs to.
+    # group_reps: group → {course → (days_frozenset, start_min, end_min)} — the first
+    # non-overlapping time found for each course in the group; used to bias later
+    # sections of other group courses away from it (best-effort, checked at the end).
+    non_overlap_groups = non_overlap_groups or {}
+    course_to_groups: Dict[str, List[str]] = {}
+    for grp, courses_in_grp in non_overlap_groups.items():
+        for c in courses_in_grp:
+            course_to_groups.setdefault(c, []).append(grp)
+    group_reps: Dict[str, Dict[str, Tuple[frozenset, int, int]]] = {}
+
+    def _group_bias(course_number: str, days: List[str], start_min: int, end_min: int) -> int:
+        """0 if this slot keeps a non-overlapping representative achievable for
+        every group this course belongs to, 1 if it would clash with another
+        course's already-established representative (deprioritized, not banned)."""
+        cn = normalize(course_number)
+        for grp in course_to_groups.get(cn, []):
+            reps = group_reps.get(grp, {})
+            if cn in reps:
+                continue  # this course already has a safe representative
+            for other_cn, (o_days, o_s, o_e) in reps.items():
+                if other_cn != cn and blocks_overlap(days, start_min, end_min, list(o_days), o_s, o_e):
+                    return 1
+        return 0
+
+    def _record_group_rep(course_number: str, days: List[str], start_min: int, end_min: int) -> None:
+        cn = normalize(course_number)
+        for grp in course_to_groups.get(cn, []):
+            reps = group_reps.setdefault(grp, {})
+            if cn in reps:
+                continue
+            conflict = any(
+                other_cn != cn and blocks_overlap(days, start_min, end_min, list(o_days), o_s, o_e)
+                for other_cn, (o_days, o_s, o_e) in reps.items()
+            )
+            if not conflict:
+                reps[cn] = (frozenset(days), start_min, end_min)
 
     # ── integrated state ───────────────────────────────────────────────────────
     faculty_load: Dict[str, int] = {f: 0 for f in faculty_limits}
@@ -748,6 +819,7 @@ def build_schedule(
             ))
         else:
             raw.sort(key=lambda t: (time_sched._busyness(t, days), t.start.hour, t.start.minute))
+        raw.sort(key=lambda t: _group_bias(sec.course_number, days, t2m(t.start), t2m(t.stop)))
 
         for lec_slot in raw:
             if lec_slot.days_allowed and not all(d in lec_slot.days_allowed for d in days):
@@ -904,6 +976,7 @@ def build_schedule(
             has_lab=sec.lab_hours > 0,
             is_lab=False,
         )
+        _record_group_rep(sec.course_number, days, t2m(slot.start), t2m(slot.stop))
 
         # ── lab ───────────────────────────────────────────────────────────────
         if sec.lab_hours > 0:
@@ -1243,6 +1316,46 @@ class ConstraintChecker:
         return ok
 
 
+def check_non_overlap_groups(
+    sections: Dict[str, ScheduledSection],
+    groups: Dict[str, List[str]],
+) -> bool:
+    """Best-effort verification for data/non_overlap_groups.csv: for every pair
+    of courses within a group, at least one scheduled lecture section of each
+    course must not share a day/time with any section of the other — so a
+    student following the curriculum can register for one section of each
+    without a clash. Reports failures as warnings; does not raise.
+    """
+    if not groups:
+        return True
+
+    by_course: Dict[str, List[ScheduledSection]] = {}
+    for s in sections.values():
+        if not s.is_lab:
+            by_course.setdefault(normalize(s.course_number), []).append(s)
+
+    print("\n── NON-OVERLAP GROUP CHECK (data/non_overlap_groups.csv) ──")
+    all_ok = True
+    for grp, courses in groups.items():
+        present = [c for c in courses if c in by_course]
+        for i, c1 in enumerate(present):
+            for c2 in present[i + 1:]:
+                secs1, secs2 = by_course[c1], by_course[c2]
+                has_clear_pair = any(
+                    not blocks_overlap(a.days, t2m(a.start_time), t2m(a.end_time),
+                                       b.days, t2m(b.start_time), t2m(b.end_time))
+                    for a in secs1 for b in secs2
+                )
+                if has_clear_pair:
+                    print(f"  ✓ PASS  {grp}: {c1} / {c2} have a non-overlapping section pair")
+                else:
+                    print(f"  ✗ FAIL  {grp}: {c1} / {c2} — every section pair overlaps; "
+                          f"a student cannot take both without a conflict")
+                    all_ok = False
+    print("────────────────────────────────────────────────────────────\n")
+    return all_ok
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # EXPORTERS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1426,6 +1539,7 @@ def _run() -> None:
     faculty_limits = load_faculty_loads(dp("faculty_load.csv"))
     rooms          = load_rooms(dp("rooms.csv"))
     room_prefs     = load_room_preferences(dp("room_preferences.csv"))
+    overlap_groups = load_non_overlap_groups(dp("non_overlap_groups.csv"))
 
     course_titles = {normalize(c.number): c.name for c in courses}
     sections      = build_sections(courses, fac_prefs)
@@ -1433,10 +1547,12 @@ def _run() -> None:
     # Faculty, time, and room are now assigned jointly inside build_schedule.
     time_sched    = TimeSlotScheduler(timeslots)
     room_assigner = RoomAssigner(rooms, room_prefs)
-    scheduled     = build_schedule(sections, fac_prefs, faculty_limits, time_sched, room_assigner)
+    scheduled     = build_schedule(sections, fac_prefs, faculty_limits, time_sched, room_assigner,
+                                    non_overlap_groups=overlap_groups)
 
     print_summary(scheduled, courses, faculty_limits, time_sched.slot_load)
     ConstraintChecker(fac_prefs).run_all(scheduled, faculty_limits)
+    check_non_overlap_groups(scheduled, overlap_groups)
     export_json(scheduled, courses, os.path.join(base, "schedule.json"))
     export_csv(scheduled, course_titles, os.path.join(base, "schedule.csv"))
 

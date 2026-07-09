@@ -376,5 +376,14 @@
   ✓ PASS  C19 Faculty preference honored (hard constraint)
 ════════════════════════════════════════════════════════════
 
+
+── NON-OVERLAP GROUP CHECK (data/non_overlap_groups.csv) ──
+  ✓ PASS  Y1_SPRING: COMP1050 / COMP1200 have a non-overlapping section pair
+  ✓ PASS  Y2_FALL: COMP2000 / COMP2100 have a non-overlapping section pair
+  ✓ PASS  Y2_FALL: COMP2000 / COMP2650 have a non-overlapping section pair
+  ✓ PASS  Y2_FALL: COMP2100 / COMP2650 have a non-overlapping section pair
+  ✓ PASS  Y2_SPRING: COMP2350 / COMP3400 have a non-overlapping section pair
+────────────────────────────────────────────────────────────
+
 ✓ Exported 180 events → /Users/aakashmkj/WIT Class Scheduler/class-scheduler/clean/schedule.json
 ✓ Exported Excel-style CSV → /Users/aakashmkj/WIT Class Scheduler/class-scheduler/clean/schedule.csv
