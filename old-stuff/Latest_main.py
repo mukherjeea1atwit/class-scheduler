@@ -8,7 +8,6 @@ import csv
 import io
 import json
 import math
-import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -19,25 +18,13 @@ from typing import Dict, List, Optional, Tuple
 # CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Grad courses per prof : 2 max
-# Prof preference is a hard constraint
-# underloaded professor recheck logic -> Prog 1 2 or DS if underlaoded
-
-# ── Course-list selector ──────────────────────────────────────────────────────
-# True  → Spring 27 Excel file  ("list of courses and hours COMP - Spring 27.xlsx")
-# False → original CSV          ("data/course_list.csv")
-USE_SPRING27 = True
-# ─────────────────────────────────────────────────────────────────────────────
-
 ALL_DAYS        = ["M", "T", "W", "Th", "F"]
 LECTURE_PATTERNS = [["M", "W"], ["T", "Th"], ["W", "F"]]
-# Grad courses meet one night/week; F excluded — no evening slots exist on Friday
-GRAD_SINGLE_DAY_PATTERNS = [["M"], ["T"], ["W"], ["Th"]]
-GRAD_START_HR   = 18        # 6 PM — grad courses start at 18:00
-GRAD_END_HR     = 19        # grad start window: 18:00 ≤ hour < 19
+GRAD_START_HR   = 17        # 5 PM — earliest start for grad courses
+GRAD_END_HR     = 20        # 8 PM — latest start for grad courses
 FACULTY_GAP_MIN = 15        # min gap between back-to-back classes for same faculty
 RESERVED_START  = 12 * 60   # Tue/Thu 12:00 reserved (minutes from midnight)
-RESERVED_END    = 13 * 60   # Tue/Thu 13:00 — ends at 1 PM so 1:00 PM slots are free
+RESERVED_END    = 13 * 60 + 30  # Tue/Thu 13:30
 AM_CUTOFF_HR    = 12        # hours before this = AM
 AM_TARGET_RATIO = 0.60      # 60 % of undergrad meetings should be AM
 
@@ -121,9 +108,7 @@ def to_int(s: str, default: int = 0) -> int:
 
 
 def parse_time(s: str) -> time:
-    parts = s.strip().split(":")
-    h, m = int(parts[0]), int(parts[1])
-    sec = int(parts[2]) if len(parts) > 2 else 0
+    h, m, sec = (int(x) for x in s.strip().split(":"))
     return time(h, m, sec)
 
 
@@ -164,18 +149,10 @@ def per_meeting_min(total_min: int, num_days: int) -> int:
     return (total_min + num_days - 1) // num_days
 
 
-def lecture_lab_minutes(lecture_hours: int, lab_hours: int, graduate: bool = False) -> Tuple[int, int]:
-    if graduate:
-        # All grad courses: single 155-min evening session (18:00-20:35), no labs
-        return 155, 0
-    if lecture_hours == 3:
-        # 3-2-4 offering: 90 min/meeting × 2 days; lab is 1 h 45 min (105 min)
-        return 180, 105
-    if lecture_hours == 4:
-        # 4-0-4 offering: 80 min/meeting × 2 days; no lab
-        return 160, 0
-    # Fallback for other hour counts
-    return lecture_hours * 60, (90 if lab_hours >= 2 else lab_hours * 60)
+def lecture_lab_minutes(lecture_hours: int, lab_hours: int) -> Tuple[int, int]:
+    lec = 150 if lecture_hours == 3 else (240 if lecture_hours == 4 else lecture_hours * 60)
+    lab = 105 if lab_hours == 2 else lab_hours * 60
+    return lec, lab
 
 
 def overlaps_reserved(days: List[str], start: time, end: time) -> bool:
@@ -191,32 +168,21 @@ def times_conflict(s1: int, e1: int, s2: int, e2: int, gap: int = FACULTY_GAP_MI
     return not (e1 + gap <= s2 or e2 + gap <= s1)
 
 
+def preferred_lab_day(lecture_days: List[str]) -> str:
+    """Choose the best single day for a lab given the lecture day pattern."""
+    joined = "".join(lecture_days)
+    mapping = {"MW": "F", "TTh": "F", "WF": "M"}
+    if joined in mapping:
+        return mapping[joined]
+    for d in ALL_DAYS:
+        if d not in lecture_days:
+            return d
+    return "F"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CSV LOADERS
 # ──────────────────────────────────────────────────────────────────────────────
-
-def load_courses_excel(path: str) -> List[Course]:
-    """Load courses from the Spring 27 Excel workbook."""
-    import openpyxl
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    out = []
-    for row in rows[1:]:           # skip header row
-        if row[1] is None:         # skip empty rows
-            continue
-        out.append(Course(
-            number=str(row[1]).strip(),
-            name=str(row[2]).strip() if row[2] else "",
-            lecture_days_per_week=int(row[3]) if row[3] is not None else 0,
-            lecture_hours=int(row[4]) if row[4] is not None else 0,
-            lab_hours=int(row[5]) if row[5] is not None else 0,
-            sections=int(row[6]) if row[6] is not None else 0,
-            preferred_room=str(row[7]).strip() if row[7] else None,
-        ))
-    return out
-
 
 def load_courses(path: str) -> List[Course]:
     out = []
@@ -426,9 +392,6 @@ class TimeSlotScheduler:
         self.slots = sorted(timeslots, key=lambda t: (t.start.hour, t.start.minute))
         self._faculty_busy: Dict[str, Dict[str, List[Tuple[int, int]]]] = {}
         self._slot_load: Dict[str, Dict[str, int]] = {d: {} for d in ALL_DAYS}
-        # Counts all sections by (day, start_minute) regardless of duration.
-        # Used for C11: prevents > 10 concurrent sections at the same start time.
-        self._start_load: Dict[str, Dict[int, int]] = {d: {} for d in ALL_DAYS}
 
     # ── public interface ────────────────────────────────────────────
 
@@ -446,8 +409,6 @@ class TimeSlotScheduler:
         ordered = sorted(candidates, key=lambda t: (self._busyness(t, days), t.start.hour, t.start.minute))
 
         for slot in ordered:
-            if slot.days_allowed and not all(d in slot.days_allowed for d in days):
-                continue
             if overlaps_reserved(days, slot.start, slot.stop):
                 continue
             if not self._slot_capacity_ok(days, slot):        # C11
@@ -510,17 +471,13 @@ class TimeSlotScheduler:
             entry.setdefault(d, []).append((s, e))
 
     def _slot_capacity_ok(self, days: List[str], slot: TimeSlot) -> bool:
-        # Count ALL sections starting at the same time (any duration) to correctly
-        # enforce the ≤ 10 concurrent limit regardless of slot length variation.
-        start_min = t2m(slot.start)
-        return all(self._start_load[d].get(start_min, 0) < 10 for d in days)
+        key = self._slot_key(slot)
+        return all(self._slot_load[d].get(key, 0) < 10 for d in days)
 
     def _increment_load(self, days: List[str], slot: TimeSlot) -> None:
         key = self._slot_key(slot)
-        start_min = t2m(slot.start)
         for d in days:
             self._slot_load[d][key] = self._slot_load[d].get(key, 0) + 1
-            self._start_load[d][start_min] = self._start_load[d].get(start_min, 0) + 1
 
     def _busyness(self, slot: TimeSlot, days: List[str]) -> int:
         key = self._slot_key(slot)
@@ -606,87 +563,36 @@ def build_schedule(
                 seen.add(f)
         return result
 
-    def _patterns_for(sec: Section) -> List[List[str]]:
-        """Ordered pool of day patterns to try for a section.
-        Grad courses with lecture_days_per_week==1 prefer single-day evenings (M/T/W/Th),
-        falling back to 2-day patterns for courses whose total minutes exceed the longest
-        single evening slot (e.g. 4-credit courses needing 240 min).
+    def viable_patterns(fac: str) -> List[List[str]]:
         """
-        if is_grad(sec.course_number) and sec.lecture_days_per_week == 1:
-            return GRAD_SINGLE_DAY_PATTERNS + LECTURE_PATTERNS
-        return LECTURE_PATTERNS
-
-    def viable_patterns(fac: str, sec: Section) -> List[List[str]]:
-        """
-        Return patterns that keep faculty ≤ 4 days (C4), sorted by load added to
-        already-busy days (lightest first, for C16 balance).
-        For grad single-day courses, single-day patterns are ranked first; 2-day patterns
-        follow as a fallback (e.g. 4-credit courses that exceed the longest evening slot).
+        Return LECTURE_PATTERNS that keep faculty ≤ 4 days (C4), sorted by how much
+        load they'd add to already-busy days (lightest first, for C16 balance).
         Falls back to all patterns if C4 cannot be satisfied.
         """
         current = faculty_days_map.get(fac, set())
+        ok, over = [], []
+        for pattern in LECTURE_PATTERNS:
+            score = sum(day_count.get(d, 0) for d in pattern)
+            if len(current | set(pattern)) <= 4:
+                ok.append((score, pattern))
+            else:
+                over.append((score, pattern))
+        ok.sort(key=lambda x: x[0])
+        over.sort(key=lambda x: x[0])
+        return [p for _, p in ok] or [p for _, p in over]
 
-        def _rank(pool: List[List[str]]) -> List[List[str]]:
-            ok, over = [], []
-            for p in pool:
-                score = sum(day_count.get(d, 0) for d in p)
-                (ok if len(current | set(p)) <= 4 else over).append((score, p))
-            ok.sort(key=lambda x: x[0])
-            over.sort(key=lambda x: x[0])
-            return [p for _, p in ok] or [p for _, p in over]
-
-        if is_grad(sec.course_number) and sec.lecture_days_per_week == 1:
-            return _rank(GRAD_SINGLE_DAY_PATTERNS) + _rank(LECTURE_PATTERNS)
-        return _rank(LECTURE_PATTERNS)
-
-    LAB_MAX_MIN = 105  # lab sessions are 1 h 45 min (105 min) in the 3-2-4 offering
-
-    def _lab_day_candidates(fac: str, lecture_days: List[str]) -> List[str]:
-        """All non-lecture days ordered by preference: C4-safe first, then least-loaded."""
-        current = faculty_days_map.get(fac, set()) | set(lecture_days)
-        non_lecture = [d for d in ALL_DAYS if d not in lecture_days]
-        c4_ok = sorted([d for d in non_lecture if len(current | {d}) <= 4],
-                       key=lambda d: day_count.get(d, 0))
-        overflow = sorted([d for d in non_lecture if d not in c4_ok],
-                          key=lambda d: day_count.get(d, 0))
-        return c4_ok + overflow
-
-    def _find_lab_at(
-        fac: str,
-        lecture_days: List[str],
-        lec_slot: "TimeSlot",
-    ) -> Optional[Tuple[str, "TimeSlot", str]]:
+    def best_lab_day(fac: str, lecture_days: List[str]) -> str:
         """
-        Find (lab_day, lab_slot, lab_room) where lab_slot.start == lec_slot.start.
-        Only considers C4-safe days (adding the day keeps faculty ≤ 4 days/week).
-        Returns None if no valid same-start lab can be placed.
+        Pick the lab day that:
+          1. Is not a lecture day (C9)
+          2. Keeps faculty ≤ 4 days (C4) if possible
+          3. Is the least loaded day overall (C16 balance)
         """
         current = faculty_days_map.get(fac, set()) | set(lecture_days)
         non_lecture = [d for d in ALL_DAYS if d not in lecture_days]
-        c4_safe = sorted(
-            [d for d in non_lecture if len(current | {d}) <= 4],
-            key=lambda d: day_count.get(d, 0),
-        )
-        for lab_day in c4_safe:
-            for lab_s in time_sched.slots:
-                if lab_s.start != lec_slot.start:
-                    continue
-                if lab_s.duration_min < lab_min or lab_s.duration_min > LAB_MAX_MIN:
-                    continue
-                if lab_s.days_allowed and lab_day not in lab_s.days_allowed:
-                    continue
-                if overlaps_reserved([lab_day], lab_s.start, lab_s.stop):
-                    continue
-                if not time_sched._slot_capacity_ok([lab_day], lab_s):
-                    continue
-                if not time_sched._faculty_free(fac, [lab_day], lab_s.start, lab_s.stop):
-                    continue
-                if time_sched._would_exceed_span(fac, [lab_day], lab_s.start, lab_s.stop):
-                    continue
-                lab_room = room_assigner.find_room(sec, [lab_day], lab_s.start, lab_s.stop, is_lab=True)
-                if lab_room is not None:
-                    return lab_day, lab_s, lab_room
-        return None
+        c4_ok = [d for d in non_lecture if len(current | {d}) <= 4]
+        pool = c4_ok if c4_ok else non_lecture
+        return min(pool, key=lambda d: day_count.get(d, 0))
 
     def _try_assign(
         sec: Section,
@@ -694,69 +600,32 @@ def build_schedule(
         days: List[str],
         lec_min: int,
         force_pm: bool,
-    ) -> Optional[Tuple]:
-        """
-        Find (days, lec_slot, lec_room, lab_day, lab_slot, lab_room).
-        When the section has a lab, the lab slot must start at the SAME CLOCK TIME
-        as the lecture slot (hard constraint). Returns None if impossible.
-        lab_day/slot/room are None when lab_hours == 0.
-        """
+    ) -> Optional[Tuple[List[str], "TimeSlot", str]]:
+        """Try to find a (days, slot, room) for one (faculty, pattern) combo. None if impossible."""
         per_day = per_meeting_min(lec_min, len(days))
-
-        # Collect and order candidate lecture slots.
-        # max_duration=per_day ensures lectures only get slots of the correct duration
-        # and never spill into the wider lab_105 slots.
-        # When force_pm is set, sort PM slots before AM so they're tried first.
-        raw = time_sched._eligible_slots(sec, per_day, force_pm=False, max_duration=per_day)
-        if force_pm:
-            raw.sort(key=lambda t: (
-                0 if t.start.hour >= AM_CUTOFF_HR else 1,
-                time_sched._busyness(t, days),
-                t.start.hour, t.start.minute,
-            ))
-        else:
-            raw.sort(key=lambda t: (time_sched._busyness(t, days), t.start.hour, t.start.minute))
-
-        for lec_slot in raw:
-            if lec_slot.days_allowed and not all(d in lec_slot.days_allowed for d in days):
-                continue
-            if overlaps_reserved(days, lec_slot.start, lec_slot.stop):
-                continue
-            if not time_sched._slot_capacity_ok(days, lec_slot):
-                continue
-            if not time_sched._faculty_free(fac, days, lec_slot.start, lec_slot.stop):
-                continue
-            if time_sched._would_exceed_span(fac, days, lec_slot.start, lec_slot.stop):
-                continue
-
-            lec_room = room_assigner.find_room(sec, days, lec_slot.start, lec_slot.stop, is_lab=False)
-            if lec_room is None:
-                continue
-
-            if sec.lab_hours == 0:
-                return days, lec_slot, lec_room, None, None, None
-
-            lab_info = _find_lab_at(fac, days, lec_slot)
-            if lab_info is not None:
-                return days, lec_slot, lec_room, *lab_info
-            # This lecture slot can't pair with a same-start lab; try next slot.
-
-        return None
+        slot = time_sched.find_slot(sec, fac, days, per_day, force_pm=force_pm)
+        if slot is None and force_pm:
+            slot = time_sched.find_slot(sec, fac, days, per_day, force_pm=False)
+        if slot is None:
+            return None
+        room = room_assigner.find_room(sec, days, slot.start, slot.stop, is_lab=False)
+        if room is None:
+            return None
+        return (days, slot, room)
 
     # ── main scheduling loop ──────────────────────────────────────────────────
 
     for sec in ordered:
-        lec_min, lab_min = lecture_lab_minutes(sec.lecture_hours, sec.lab_hours, is_grad(sec.course_number))
+        lec_min, lab_min = lecture_lab_minutes(sec.lecture_hours, sec.lab_hours)
         force_pm = not is_grad(sec.course_number) and am_used >= max_am
 
-        # chosen = (fac, days, lec_slot, lec_room, lab_day|None, lab_slot|None, lab_room|None)
-        chosen = None
+        chosen: Optional[Tuple[str, List[str], "TimeSlot", str]] = None  # (fac, days, slot, room)
 
         # Search jointly over (faculty × day_pattern) until all constraints satisfied
         for fac in faculty_candidates(sec):
             if not can_assign(fac, sec):
                 continue
-            for days in viable_patterns(fac, sec):
+            for days in viable_patterns(fac):
                 result = _try_assign(sec, fac, days, lec_min, force_pm)
                 if result:
                     chosen = (fac, *result)
@@ -767,7 +636,7 @@ def build_schedule(
         # Fallback: TBA faculty, any pattern
         if not chosen:
             print(f"[WARN] {sec.id}: No faculty satisfied all constraints; trying TBA.")
-            for days in _patterns_for(sec):
+            for days in LECTURE_PATTERNS:
                 result = _try_assign(sec, "TBA", days, lec_min, False)
                 if result:
                     chosen = ("TBA", *result)
@@ -776,15 +645,13 @@ def build_schedule(
         # Hard fallback: force something rather than crash
         if not chosen:
             print(f"[CRITICAL] {sec.id}: No assignment found; forcing.")
-            days_f = _patterns_for(sec)[0]
+            days_f = LECTURE_PATTERNS[0]
             per_day_f = per_meeting_min(lec_min, len(days_f))
             cands = time_sched._eligible_slots(sec, per_day_f, force_pm=False, max_duration=None)
             slot_f = cands[0] if cands else time_sched.slots[0]
-            lab_info_f = _find_lab_at("TBA", days_f, slot_f) if sec.lab_hours > 0 else None
-            chosen = ("TBA", days_f, slot_f, "FORCE_ASSIGN_ROOM",
-                      *(lab_info_f if lab_info_f else (None, None, None)))
+            chosen = ("TBA", days_f, slot_f, "FORCE_ASSIGN_ROOM")
 
-        fac, days, slot, room, pre_lab_day, pre_lab_slot, pre_lab_room = chosen
+        fac, days, slot, room = chosen
 
         # Commit lecture
         room_assigner.book_room(room, days, slot.start, slot.stop)
@@ -811,30 +678,33 @@ def build_schedule(
 
         # ── lab ───────────────────────────────────────────────────────────────
         if sec.lab_hours > 0:
-            if pre_lab_day is not None:
-                # Same-start lab found during assignment — commit it directly.
-                lab_day, lab_slot, lab_room = pre_lab_day, pre_lab_slot, pre_lab_room
-                room_assigner.book_room(lab_room, [lab_day], lab_slot.start, lab_slot.stop)
+            force_pm_lab = not is_grad(sec.course_number) and am_used >= max_am
+            lab_day = best_lab_day(fac, days)
+
+            LAB_MAX_MIN = 130  # C7: labs must be ≤ 130 min
+            lab_slot = time_sched.find_slot(sec, fac, [lab_day], lab_min, force_pm=force_pm_lab, max_duration=LAB_MAX_MIN)
+            if lab_slot is None:
+                lab_slot = time_sched.find_slot(sec, fac, [lab_day], lab_min, max_duration=LAB_MAX_MIN)
+
+            # Try other non-lecture days if preferred lab day has no slot
+            if lab_slot is None:
+                for alt in ALL_DAYS:
+                    if alt not in days:
+                        lab_slot = time_sched.find_slot(sec, fac, [alt], lab_min, max_duration=LAB_MAX_MIN)
+                        if lab_slot:
+                            lab_day = alt
+                            break
+
+            if lab_slot is None:
+                print(f"[CRITICAL] {sec.id}-LAB: No time slot found; forcing.")
+                cands = time_sched._eligible_slots(sec, lab_min, force_pm=False, max_duration=LAB_MAX_MIN)
+                lab_slot = cands[0] if cands else time_sched.slots[0]
+
+            lab_room = room_assigner.find_room(sec, [lab_day], lab_slot.start, lab_slot.stop, is_lab=True)
+            if lab_room is None:
+                lab_room = "FORCE_ASSIGN_ROOM"
             else:
-                # Hard-fallback path: no same-start lab found; place lab anywhere available.
-                print(f"[WARN] {sec.id}-LAB: could not match lecture start time; scheduling independently.")
-                lab_day_candidates = _lab_day_candidates(fac, days)
-                lab_slot = None
-                lab_day = lab_day_candidates[0] if lab_day_candidates else ALL_DAYS[0]
-                for ld in lab_day_candidates:
-                    lab_slot = time_sched.find_slot(sec, fac, [ld], lab_min, max_duration=LAB_MAX_MIN)
-                    if lab_slot:
-                        lab_day = ld
-                        break
-                if lab_slot is None:
-                    print(f"[CRITICAL] {sec.id}-LAB: No time slot found; forcing.")
-                    cands = time_sched._eligible_slots(sec, lab_min, force_pm=False, max_duration=LAB_MAX_MIN)
-                    lab_slot = cands[0] if cands else time_sched.slots[0]
-                lab_room = room_assigner.find_room(sec, [lab_day], lab_slot.start, lab_slot.stop, is_lab=True)
-                if lab_room is None:
-                    lab_room = "FORCE_ASSIGN_ROOM"
-                else:
-                    room_assigner.book_room(lab_room, [lab_day], lab_slot.start, lab_slot.stop)
+                room_assigner.book_room(lab_room, [lab_day], lab_slot.start, lab_slot.stop)
 
             time_sched.book(fac, [lab_day], lab_slot)
             faculty_days_map.setdefault(fac, set()).add(lab_day)
@@ -889,12 +759,11 @@ class ConstraintChecker:
             ("C9  Lab on different day than lecture",           self._c9_lab_day),
             ("C10 Lab is exactly one day",                      self._c10_lab_one_day),
             ("C11 ≤ 10 concurrent sections per time slot",      self._c11_concurrency),
-            ("C12 Graduate courses start at 6 PM (18:00)",       self._c12_grad_time),
+            ("C12 Graduate courses start between 5–8 PM",       self._c12_grad_time),
             ("C13 Same faculty for lecture and its lab",        self._c13_lab_faculty),
             ("C14 ≤ 2 sections of same course at same time",    self._c14_time_dupes),
             ("C15 Lecture day patterns: MW / TTh / WF only",    self._c15_patterns),
             ("C16 Sections balanced across weekdays (≤ 40 %)",  self._c16_balance),
-            ("C17 Lab starts at the same time as its lecture",   self._c17_lab_same_start),
         ]
 
         print("\n══════════════════ CONSTRAINT VALIDATION ══════════════════")
@@ -941,8 +810,6 @@ class ConstraintChecker:
                 )
         ok = True
         for fac, days in fac_days.items():
-            if fac == "TBA":
-                continue  # TBA is a placeholder, not a real faculty member
             for d, slots in days.items():
                 span_hr = (max(e for _, e in slots) - min(s for s, _ in slots)) / 60
                 if span_hr > 9:
@@ -988,18 +855,12 @@ class ConstraintChecker:
             if not s.start_time:
                 continue
             dur = t2m(s.end_time) - t2m(s.start_time)
-            if s.is_lab:
-                if not (100 <= dur <= 110):
-                    print(f"    LAB {sid}: {dur} min (expect 105)")
-                    ok = False
-            elif is_grad(s.course_number):
-                if not (145 <= dur <= 165):
-                    print(f"    {sid}: {dur} min (grad, expect 155)")
-                    ok = False
-            else:
-                if not (75 <= dur <= 95):
-                    print(f"    LEC {sid}: {dur} min (expect 80 or 90)")
-                    ok = False
+            if s.is_lab and not (100 <= dur <= 130):
+                print(f"    LAB {sid}: {dur} min (expect 100–130)")
+                ok = False
+            elif not s.is_lab and not (60 <= dur <= 260):
+                print(f"    LEC {sid}: {dur} min out of range")
+                ok = False
         return ok
 
     def _c9_lab_day(self, sections, _):
@@ -1046,7 +907,7 @@ class ConstraintChecker:
         for sid, s in sections.items():
             if s.start_time and is_grad(s.course_number):
                 if not (GRAD_START_HR <= s.start_time.hour < GRAD_END_HR):
-                    print(f"    {sid}: starts at {s.start_time} (not 6 PM)")
+                    print(f"    {sid}: starts at {s.start_time} (not 5–8 PM)")
                     ok = False
         return ok
 
@@ -1093,21 +954,6 @@ class ConstraintChecker:
         for d, c in count.items():
             if avg > 0 and abs(c - avg) > 0.4 * avg:
                 print(f"    {d}: {c} sections vs avg {avg:.1f} (>40 % deviation)")
-                ok = False
-        return ok
-
-    def _c17_lab_same_start(self, sections, _):
-        ok = True
-        for sid, s in sections.items():
-            if not s.is_lab or not s.start_time:
-                continue
-            base = sid.replace("-LAB", "")
-            if base not in sections:
-                continue
-            lec = sections[base]
-            if lec.start_time and t2m(s.start_time) != t2m(lec.start_time):
-                print(f"    {sid}: lab starts {s.start_time.strftime('%H:%M')} "
-                      f"≠ lecture {lec.start_time.strftime('%H:%M')}")
                 ok = False
         return ok
 
@@ -1285,16 +1131,12 @@ def print_summary(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _run() -> None:
-    base = os.path.dirname(os.path.abspath(__file__))
-    def dp(name: str) -> str:
-        return os.path.join(base, "data", name)
-
-    courses        = load_courses(dp("course-list-Spring 27(Sheet1) (1).csv"))
-    fac_prefs      = load_faculty_preferences(dp("prof_preferences.csv"))
-    timeslots      = load_timeslots(dp("timings.csv"))
-    faculty_limits = load_faculty_loads(dp("faculty_load.csv"))
-    rooms          = load_rooms(dp("rooms.csv"))
-    room_prefs     = load_room_preferences(dp("room_preferences.csv"))
+    courses        = load_courses("data/course_list.csv")
+    fac_prefs      = load_faculty_preferences("data/prof_preferences.csv")
+    timeslots      = load_timeslots("data/timings.csv")
+    faculty_limits = load_faculty_loads("data/faculty_load.csv")
+    rooms          = load_rooms("data/rooms.csv")
+    room_prefs     = load_room_preferences("data/room_preferences.csv")
 
     course_titles = {normalize(c.number): c.name for c in courses}
     sections      = build_sections(courses, fac_prefs)
@@ -1306,8 +1148,8 @@ def _run() -> None:
 
     print_summary(scheduled, courses, faculty_limits, time_sched.slot_load)
     ConstraintChecker().run_all(scheduled, faculty_limits)
-    export_json(scheduled, courses, os.path.join(base, "schedule.json"))
-    export_csv(scheduled, course_titles, os.path.join(base, "schedule.csv"))
+    export_json(scheduled, courses)
+    export_csv(scheduled, course_titles)
 
 
 class _Tee(io.TextIOBase):
@@ -1335,8 +1177,7 @@ class _Tee(io.TextIOBase):
 
 
 def main() -> None:
-    result_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result.txt")
-    with open(result_path, "w", encoding="utf-8") as log:
+    with open("result.txt", "w", encoding="utf-8") as log:
         tee = _Tee(sys.stdout, log)
         with contextlib.redirect_stdout(tee):
             _run()

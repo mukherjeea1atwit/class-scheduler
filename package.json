@@ -1,0 +1,9 @@
+{
+  "name": "wit-class-scheduler",
+  "private": true,
+  "scripts": {
+    "dev": "python3 server.py",
+    "start": "python3 server.py",
+    "clean": "python3 clean/server.py"
+  }
+}
