@@ -154,10 +154,20 @@ if errorlevel 1 (
 )
 
 :: ── Drop a Start-Scheduler shortcut on the Desktop ──────────────────────────
-:: Not fatal if this fails (e.g. a redirected/read-only Desktop folder) -
-:: run.bat in the install folder still works either way.
+:: Not fatal if this fails (e.g. a read-only Desktop folder) - run.bat in the
+:: install folder still works either way.
+::
+:: NOTE: We ask WScript.Shell for its own SpecialFolders('Desktop') path rather
+:: than hardcoding "%USERPROFILE%\Desktop", because OneDrive's "Known Folder
+:: Move" (common on managed/corporate machines) redirects the visible Desktop
+:: to somewhere like %USERPROFILE%\OneDrive\Desktop. Using %USERPROFILE%\Desktop
+:: directly creates the .lnk in a folder that still exists but is no longer
+:: shown on screen - the script reports success and the user never sees an
+:: error, they just never see the icon.
 set "RUN_BAT=%APP_DIR%\windows\run.bat"
-set "SHORTCUT=%USERPROFILE%\Desktop\WIT Class Scheduler.lnk"
+for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "(New-Object -ComObject WScript.Shell).SpecialFolders('Desktop')"`) do set "DESKTOP_DIR=%%d"
+if not defined DESKTOP_DIR set "DESKTOP_DIR=%USERPROFILE%\Desktop"
+set "SHORTCUT=%DESKTOP_DIR%\WIT Class Scheduler.lnk"
 powershell -NoProfile -Command ^
     "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('%SHORTCUT%'); $s.TargetPath = '%RUN_BAT%'; $s.WorkingDirectory = '%APP_DIR%'; $s.IconLocation = '%SystemRoot%\System32\shell32.dll,220'; $s.Save()" >nul 2>nul
 echo.
@@ -167,6 +177,7 @@ echo ============================================
 if exist "%SHORTCUT%" (
     echo A "WIT Class Scheduler" shortcut was added to your Desktop.
     echo Double-click it any time to start the scheduler.
+    echo ^(If you don't see it, check: %DESKTOP_DIR%^)
 ) else (
     echo Could not add a Desktop shortcut, but the app is installed.
     echo Start it any time by double-clicking this file:
