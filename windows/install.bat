@@ -113,6 +113,16 @@ if errorlevel 1 (
         git pull
         popd
     ) else (
+        if exist "%INSTALL_DIR%\course-scheduler" (
+            :: A folder here without a .git subfolder means a previous install
+            :: used the zip fallback (or was interrupted) - "git clone" refuses
+            :: to clone into a non-empty directory, so move it aside instead of
+            :: deleting it in case it holds edits the user made to data\*.csv.
+            echo Found an existing install that wasn't downloaded with git - moving it aside...
+            set "BACKUP_DIR=%INSTALL_DIR%\course-scheduler-backup-%RANDOM%"
+            move "%INSTALL_DIR%\course-scheduler" "!BACKUP_DIR!" >nul
+            echo Your previous files were kept at: !BACKUP_DIR!
+        )
         echo Downloading project code...
         git clone "%REPO_URL%" "%INSTALL_DIR%\course-scheduler"
         if errorlevel 1 (
